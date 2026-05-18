@@ -22,6 +22,7 @@ import kotlin.math.sqrt
 
 enum class EngineMode { RGB, LAB }
 
+@kotlinx.serialization.Serializable
 data class Adjustments(
     val temp: Float = 0f,       
     val tint: Float = 0f,       
@@ -53,6 +54,7 @@ data class SelectiveColor(
     var isEnabled: Boolean = true
 )
 
+@kotlinx.serialization.Serializable
 data class TonalAdjustments(
     var shadowHue: Float = 0f, var shadowSat: Float = 0f, var shadowLum: Float = 0f,
     var midHue: Float = 0f, var midSat: Float = 0f, var midLum: Float = 0f,
@@ -99,11 +101,17 @@ data class ChannelMixer(
     var redInBlue: Float = 0f, var greenInBlue: Float = 0f, var blueInBlue: Float = 1f
 )
 
+@kotlinx.serialization.Serializable
 data class CinematicEffects(
     var halationThreshold: Float = 0.8f,
     var halationIntensity: Float = 0f,
     var halationSpread: Float = 2f,
-    var falseColorEnabled: Boolean = false
+    var falseColorEnabled: Boolean = false,
+    var noiseGrain: Float = 0f,
+    var ultraBlack: Float = 0f,
+    var ultraWhite: Float = 1f,
+    var ultraRed: Float = 0f,
+    var ultraBlue: Float = 0f
 )
 
 data class ColorBalance(
@@ -113,6 +121,7 @@ data class ColorBalance(
     var preserveLuminance: Boolean = true
 )
 
+@kotlinx.serialization.Serializable
 data class CurveSliders(
     var blacks: Float = 0f,      
     var shadows: Float = 0.25f,  
@@ -966,7 +975,7 @@ object LutUtils {
         return CubeLut(targetSize, data)
     }
 
-    suspend fun applyLutToBitmapFast(bitmap: Bitmap, lut: CubeLut, pixels: IntArray, adj: Adjustments): Bitmap = withContext(Dispatchers.Default) {
+    suspend fun applyLutToBitmapFast(bitmap: Bitmap, lut: CubeLut, pixels: IntArray, adj: Adjustments, cinematic: CinematicEffects): Bitmap = withContext(Dispatchers.Default) {
         val width = bitmap.width
         val height = bitmap.height
         bitmap.getPixels(pixels, 0, width, 0, 0, width, height)
@@ -974,7 +983,7 @@ object LutUtils {
         val numThreads = Runtime.getRuntime().availableProcessors()
         val chunkSize = pixels.size / numThreads
         
-        val hasGrain = adj.grain > 0f
+        val hasGrain = cinematic.noiseGrain > 0f
         
         val deferreds = (0 until numThreads).map { i ->
             async {
@@ -995,8 +1004,30 @@ object LutUtils {
                     var ng = out[1]
                     var nb = out[2]
                     
+                    // Apply Ultra Adjustments
+                    if (cinematic.ultraBlack < 0f && nr < 0.2f && ng < 0.2f && nb < 0.2f) {
+                        val intensity = (0.2f - Math.max(nr, Math.max(ng, nb))) * 5f // 0 to 1
+                        val darken = 1f + cinematic.ultraBlack * intensity
+                        nr *= darken
+                        ng *= darken
+                        nb *= darken
+                    }
+                    if (cinematic.ultraWhite > 1f && nr > 0.8f && ng > 0.8f && nb > 0.8f) {
+                        val intensity = (Math.min(nr, Math.min(ng, nb)) - 0.8f) * 5f // 0 to 1
+                        val brighten = 1f + (cinematic.ultraWhite - 1f) * intensity
+                        nr *= brighten
+                        ng *= brighten
+                        nb *= brighten
+                    }
+                    if (cinematic.ultraRed != 0f && nr > ng + 0.1f && nr > nb + 0.1f) {
+                        nr += cinematic.ultraRed * (nr - Math.max(ng, nb))
+                    }
+                    if (cinematic.ultraBlue != 0f && nb > ng + 0.1f && nb > nr + 0.1f) {
+                        nb += cinematic.ultraBlue * (nb - Math.max(nr, ng))
+                    }
+                    
                     if (hasGrain) {
-                        val noise = (Math.random() - 0.5f).toFloat() * adj.grain * 0.3f
+                        val noise = (Math.random() - 0.5f).toFloat() * cinematic.noiseGrain * 0.3f
                         nr += noise
                         ng += noise
                         nb += noise

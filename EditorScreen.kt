@@ -1,5 +1,4 @@
 package com.agon.app.ui.screens
-
 import android.content.ContentValues
 import android.content.Context
 import android.graphics.Bitmap
@@ -8,6 +7,13 @@ import android.net.Uri
 import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
+import coil3.ImageLoader
+import coil3.compose.AsyncImage
+import coil3.gif.AnimatedImageDecoder
+import coil3.gif.GifDecoder
+import coil3.request.ImageRequest
+import coil3.request.crossfade
+
 import android.provider.OpenableColumns
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -78,7 +84,8 @@ data class OverlayItem(
     val isGif: Boolean = false,
     var offset: Offset = Offset.Zero,
     var scale: Float = 1f,
-    var zIndex: Int = 100
+    var zIndex: Int = 100,
+    var applyEdits: Boolean = true
 )
 
 data class ImageItem(
@@ -305,9 +312,52 @@ fun HistogramScope(histogram: IntArray?) {
 fun EditorScreen() {
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
+    val prefsManager = remember { com.agon.app.data.PreferencesManager(context) }
     
     val images = remember { mutableStateListOf<ImageItem>() }
     val overlays = remember { mutableStateListOf<OverlayItem>() }
+    val presets = remember { mutableStateListOf<com.agon.app.data.SavedPreset>() }
+    val savedLuts = remember { mutableStateListOf<com.agon.app.data.SavedLut>() }
+    
+    LaunchedEffect(Unit) {
+        prefsManager.overlaysFlow.collect { savedOverlays ->
+            overlays.clear()
+            overlays.addAll(savedOverlays.map { 
+                OverlayItem(
+                    id = it.id, 
+                    uri = Uri.parse(it.uriString), 
+                    isGif = it.isGif, 
+                    offset = Offset(it.offsetX, it.offsetY), 
+                    scale = it.scale, 
+                    zIndex = it.zIndex,
+                    applyEdits = true
+                ) 
+            })
+        }
+    }
+    
+    LaunchedEffect(Unit) {
+        prefsManager.presetsFlow.collect { savedPresets ->
+            presets.clear()
+            presets.addAll(savedPresets)
+        }
+    }
+    
+    LaunchedEffect(Unit) {
+        prefsManager.lutsFlow.collect { luts ->
+            savedLuts.clear()
+            savedLuts.addAll(luts)
+        }
+    }
+    
+    // Save overlays whenever they change
+    LaunchedEffect(overlays.toList()) {
+        prefsManager.saveOverlays(overlays.map { 
+            com.agon.app.data.SavedOverlay(
+                it.id, it.uri.toString(), it.isGif, it.offset.x, it.offset.y, it.scale, it.zIndex
+            ) 
+        })
+    }
     var maxZIndex by remember { mutableStateOf(0) }
     
     var engineMode by remember { mutableStateOf(EngineMode.LAB) }
@@ -412,7 +462,7 @@ fun EditorScreen() {
             )
             
             val updatedImages = images.map { img ->
-                val newBmp = LutUtils.applyLutToBitmapFast(img.previewBitmap, newLut, img.pixelsBuffer, adjustments)
+                val newBmp = LutUtils.applyLutToBitmapFast(img.previewBitmap, newLut, img.pixelsBuffer, adjustments, cinematicEffects)
                 img.copy(processedBitmap = newBmp)
             }
             
@@ -482,13 +532,26 @@ fun EditorScreen() {
                 withContext(Dispatchers.Main) { isProcessingHighRes = true }
                 for (uri in uris) {
                     try {
+                        // Persist URI permission if possible
+                        try {
+                            context.contentResolver.takePersistableUriPermission(uri, android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                        } catch (e: Exception) { }
+                        
                         val inputStream = context.contentResolver.openInputStream(uri)
                         if (inputStream != null) {
                             val lut = LutUtils.parseCube(inputStream)
                             inputStream.close()
                             if (lut != null) {
+                                val lutName = "CUBE ${savedLuts.size + 1}"
+                                val newSavedLut = com.agon.app.data.SavedLut(
+                                    id = UUID.randomUUID().toString(),
+                                    name = lutName,
+                                    uriString = uri.toString()
+                                )
                                 withContext(Dispatchers.Main) { 
-                                    cubes.add(CubeItem(name = "CUBE", lut = lut)) 
+                                    savedLuts.add(newSavedLut)
+                                    prefsManager.saveLuts(savedLuts)
+                                    cubes.add(CubeItem(name = lutName, lut = lut)) 
                                     saveHistory()
                                 }
                             }
@@ -610,9 +673,47 @@ fun EditorScreen() {
                 
                 overlays.forEach { overlay ->
                     key(overlay.id) {
+                        val imageLoader = remember {
+                            ImageLoader.Builder(context)
+                                .components {
+                                    if (Build.VERSION.SDK_INT >= 28) {
+                                        add(AnimatedImageDecoder.Factory())
+                                    } else {
+                                        add(GifDecoder.Factory())
+                                    }
+                                }
+                                .build()
+                        }
+                        
+                        // Apply current color grading if enabled
+                        val colorFilter = if (overlay.applyEdits && images.isNotEmpty()) {
+                            val topImg = images.maxByOrNull { it.zIndex }
+                            val bmp = topImg?.processedBitmap ?: topImg?.previewBitmap
+                            if (bmp != null) {
+                                // Create a basic color matrix from the adjustments to tint the GIF
+                                val contrast = adjustments.contrast
+                                val brightness = adjustments.exposure * 255f
+                                val saturation = adjustments.saturation
+                                
+                                val cm = androidx.compose.ui.graphics.ColorMatrix()
+                                cm.setToScale(contrast, contrast, contrast, 1f)
+                                
+                                val satMatrix = androidx.compose.ui.graphics.ColorMatrix()
+                                satMatrix.setToSaturation(saturation)
+                                cm.timesAssign(satMatrix)
+                                
+                                androidx.compose.ui.graphics.ColorFilter.colorMatrix(cm)
+                            } else null
+                        } else null
+
                         coil3.compose.AsyncImage(
-                            model = overlay.uri,
+                            model = ImageRequest.Builder(context)
+                                .data(overlay.uri)
+                                .crossfade(true)
+                                .build(),
+                            imageLoader = imageLoader,
                             contentDescription = "Overlay",
+                            colorFilter = colorFilter,
                             modifier = Modifier
                                 .zIndex(overlay.zIndex.toFloat())
                                 .offset { IntOffset(overlay.offset.x.toInt(), overlay.offset.y.toInt()) }
@@ -786,35 +887,90 @@ fun EditorScreen() {
                 TabButton(icon = Icons.Default.Transform, title = "Mixer", selected = selectedTab == 11) { selectedTab = 11 }
                 TabButton(icon = Icons.Default.MovieFilter, title = "Cinematic", selected = selectedTab == 12) { selectedTab = 12 }
                 TabButton(icon = Icons.Default.Layers, title = "Overlays", selected = selectedTab == 13) { selectedTab = 13 }
+                TabButton(icon = Icons.Default.Style, title = "Presets", selected = selectedTab == 14) { selectedTab = 14 }
             }
             
             Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
                 AnimatedContent(targetState = selectedTab, label = "TabContent") { tab ->
                     when (tab) {
                         0 -> {
-                            LazyRow(
-                                modifier = Modifier.fillMaxSize(),
-                                contentPadding = PaddingValues(horizontal = 24.dp, vertical = 8.dp),
-                                horizontalArrangement = Arrangement.spacedBy(32.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                itemsIndexed(cubes) { index, cube ->
-                                    Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.width(60.dp)) {
-                                        IOSVerticalSlider(
-                                            value = cube.intensity,
-                                            onValueChange = { newInt ->
-                                                cubes[index] = cubes[index].copy(intensity = newInt)
+                            Column(modifier = Modifier.fillMaxSize()) {
+                                LazyRow(
+                                    modifier = Modifier.fillMaxWidth().weight(1f),
+                                    contentPadding = PaddingValues(horizontal = 24.dp, vertical = 8.dp),
+                                    horizontalArrangement = Arrangement.spacedBy(32.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    itemsIndexed(cubes) { index, cube ->
+                                        Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.width(60.dp)) {
+                                            IOSVerticalSlider(
+                                                value = cube.intensity,
+                                                onValueChange = { newInt ->
+                                                    cubes[index] = cubes[index].copy(intensity = newInt)
+                                                    triggerUpdate()
+                                                },
+                                                modifier = Modifier.height(160.dp).width(60.dp)
+                                            )
+                                            Spacer(modifier = Modifier.height(8.dp))
+                                            Text(cube.name.take(6), color = Color.White, fontSize = 10.sp, maxLines = 1)
+                                            IconButton(onClick = { 
+                                                cubes.removeAt(index)
+                                                saveHistory()
                                                 triggerUpdate()
-                                            },
-                                            modifier = Modifier.height(200.dp).width(60.dp)
-                                        )
-                                        Spacer(modifier = Modifier.height(8.dp))
-                                        IconButton(onClick = { 
-                                            cubes.removeAt(index)
-                                            saveHistory()
-                                            triggerUpdate()
-                                        }, modifier = Modifier.size(24.dp)) {
-                                            Icon(Icons.Default.Close, contentDescription = "Remove", tint = Color(0xFFFF5555))
+                                            }, modifier = Modifier.size(24.dp)) {
+                                                Icon(Icons.Default.Close, contentDescription = "Remove", tint = Color(0xFFFF5555))
+                                            }
+                                        }
+                                    }
+                                }
+                                
+                                if (savedLuts.isNotEmpty()) {
+                                    Text("Saved LUTs", color = Color.Gray, fontSize = 12.sp, modifier = Modifier.padding(horizontal = 24.dp, vertical = 4.dp))
+                                    LazyRow(
+                                        modifier = Modifier.fillMaxWidth().height(60.dp),
+                                        contentPadding = PaddingValues(horizontal = 24.dp),
+                                        horizontalArrangement = Arrangement.spacedBy(16.dp)
+                                    ) {
+                                        items(savedLuts) { savedLut ->
+                                            Surface(
+                                                color = Color(0xFF333333),
+                                                shape = RoundedCornerShape(8.dp),
+                                                modifier = Modifier.clickable {
+                                                    coroutineScope.launch(Dispatchers.IO) {
+                                                        try {
+                                                            val uri = Uri.parse(savedLut.uriString)
+                                                            val inputStream = context.contentResolver.openInputStream(uri)
+                                                            if (inputStream != null) {
+                                                                val lut = LutUtils.parseCube(inputStream)
+                                                                inputStream.close()
+                                                                if (lut != null) {
+                                                                    withContext(Dispatchers.Main) {
+                                                                        cubes.add(CubeItem(name = savedLut.name, lut = lut))
+                                                                        saveHistory()
+                                                                        triggerUpdate()
+                                                                    }
+                                                                }
+                                                            }
+                                                        } catch (e: Exception) { e.printStackTrace() }
+                                                    }
+                                                }
+                                            ) {
+                                                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
+                                                    Icon(Icons.Default.ViewInAr, contentDescription = null, tint = Color.White, modifier = Modifier.size(16.dp))
+                                                    Spacer(Modifier.width(8.dp))
+                                                    Text(savedLut.name, color = Color.White, fontSize = 12.sp)
+                                                    Spacer(Modifier.width(8.dp))
+                                                    IconButton(
+                                                        onClick = {
+                                                            savedLuts.remove(savedLut)
+                                                            coroutineScope.launch { prefsManager.saveLuts(savedLuts) }
+                                                        },
+                                                        modifier = Modifier.size(16.dp)
+                                                    ) {
+                                                        Icon(Icons.Default.Delete, contentDescription = "Delete", tint = Color.Red, modifier = Modifier.size(12.dp))
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -1210,6 +1366,17 @@ fun EditorScreen() {
                                 Text("Film Halation", color = Color.White, fontWeight = FontWeight.Bold)
                                 AdjustmentSlider("Intensity", cinematicEffects.halationIntensity, 0f, 1f) { cinematicEffects = cinematicEffects.copy(halationIntensity = it); triggerUpdate() }
                                 AdjustmentSlider("Threshold", cinematicEffects.halationThreshold, 0.5f, 1f) { cinematicEffects = cinematicEffects.copy(halationThreshold = it); triggerUpdate() }
+                                
+                                Spacer(modifier = Modifier.height(16.dp))
+                                Text("Texture & Grain", color = Color.White, fontWeight = FontWeight.Bold)
+                                AdjustmentSlider("Noise / Grain", cinematicEffects.noiseGrain, 0f, 1f) { cinematicEffects = cinematicEffects.copy(noiseGrain = it); triggerUpdate() }
+                                
+                                Spacer(modifier = Modifier.height(16.dp))
+                                Text("Ultra Adjustments", color = Color.White, fontWeight = FontWeight.Bold)
+                                AdjustmentSlider("Ultra Black", cinematicEffects.ultraBlack, -1f, 1f) { cinematicEffects = cinematicEffects.copy(ultraBlack = it); triggerUpdate() }
+                                AdjustmentSlider("Ultra White", cinematicEffects.ultraWhite, 0f, 2f) { cinematicEffects = cinematicEffects.copy(ultraWhite = it); triggerUpdate() }
+                                AdjustmentSlider("Ultra Red", cinematicEffects.ultraRed, -1f, 1f) { cinematicEffects = cinematicEffects.copy(ultraRed = it); triggerUpdate() }
+                                AdjustmentSlider("Ultra Blue", cinematicEffects.ultraBlue, -1f, 1f) { cinematicEffects = cinematicEffects.copy(ultraBlue = it); triggerUpdate() }
                             }
                         }
                         13 -> {
@@ -1229,6 +1396,84 @@ fun EditorScreen() {
                                         Text("Overlay \${overlay.id.take(4)}", color = Color.White, modifier = Modifier.weight(1f))
                                         IconButton(onClick = { overlays.remove(overlay) }) {
                                             Icon(Icons.Default.Delete, "Delete", tint = Color.Red)
+                                        }
+                                    }
+                                    
+                                    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth().padding(start = 16.dp)) {
+                                        Checkbox(
+                                            checked = overlay.applyEdits,
+                                            onCheckedChange = { checked ->
+                                                val idx = overlays.indexOf(overlay)
+                                                if (idx != -1) {
+                                                    overlays[idx] = overlay.copy(applyEdits = checked)
+                                                }
+                                            },
+                                            colors = CheckboxDefaults.colors(checkedColor = Color.White, checkmarkColor = Color.Black)
+                                        )
+                                        Text("Apply Color Grading to this GIF", color = Color.LightGray, fontSize = 12.sp)
+                                    }
+                                }
+                            }
+                        }
+                        14 -> {
+                            // Presets
+                            Column(
+                                modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 24.dp, vertical = 8.dp),
+                                verticalArrangement = Arrangement.spacedBy(16.dp),
+                                horizontalAlignment = Alignment.CenterHorizontally
+                            ) {
+                                Button(
+                                    onClick = {
+                                        val newPreset = com.agon.app.data.SavedPreset(
+                                            id = UUID.randomUUID().toString(),
+                                            name = "Preset ${presets.size + 1}",
+                                            adjustments = adjustments.copy(),
+                                            toning = toning.copy(),
+                                            curves = curves.copy(),
+                                            cinematic = cinematicEffects.copy()
+                                        )
+                                        presets.add(newPreset)
+                                        coroutineScope.launch { prefsManager.savePresets(presets) }
+                                        Toast.makeText(context, "Preset Saved!", Toast.LENGTH_SHORT).show()
+                                    },
+                                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF6200EA))
+                                ) {
+                                    Icon(Icons.Default.Save, contentDescription = null)
+                                    Spacer(Modifier.width(8.dp))
+                                    Text("Save Current Edits as Preset")
+                                }
+                                
+                                if (presets.isEmpty()) {
+                                    Text("No presets saved yet.", color = Color.Gray)
+                                } else {
+                                    presets.forEach { preset ->
+                                        Surface(
+                                            color = Color(0xFF333333),
+                                            shape = RoundedCornerShape(12.dp),
+                                            modifier = Modifier.fillMaxWidth().clickable {
+                                                adjustments = preset.adjustments.copy()
+                                                toning = preset.toning.copy()
+                                                curves = preset.curves.copy()
+                                                cinematicEffects = preset.cinematic.copy()
+                                                saveHistory()
+                                                triggerUpdate()
+                                                Toast.makeText(context, "Applied ${preset.name}", Toast.LENGTH_SHORT).show()
+                                            }
+                                        ) {
+                                            Row(
+                                                verticalAlignment = Alignment.CenterVertically,
+                                                modifier = Modifier.padding(16.dp)
+                                            ) {
+                                                Icon(Icons.Default.AutoFixHigh, contentDescription = null, tint = Color.White)
+                                                Spacer(Modifier.width(16.dp))
+                                                Text(preset.name, color = Color.White, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                                                IconButton(onClick = {
+                                                    presets.remove(preset)
+                                                    coroutineScope.launch { prefsManager.savePresets(presets) }
+                                                }) {
+                                                    Icon(Icons.Default.Delete, contentDescription = "Delete", tint = Color.Red)
+                                                }
+                                            }
                                         }
                                     }
                                 }
@@ -1303,7 +1548,7 @@ fun EditorScreen() {
                         isSaving = true
                         coroutineScope.launch {
                             val finalLut = LutUtils.mixLutsAndAdjustments(cubes.map { Pair(it.lut, it.intensity) }, selectiveColors.toList(), adjustments, engineMode, matchSourceStats, matchTargetStats, matchLum, matchIntensity, matchFade, toning, curves, hslAdjustments, colorWheels, advancedCurves, colorBalance, channelMixer, cinematicEffects, 64)
-                            images.forEach { img -> saveImage(context, img.originalBitmap, finalLut, adjustments) }
+                            images.forEach { img -> saveImage(context, img.originalBitmap, finalLut, adjustments, cinematicEffects) }
                             isSaving = false
                         }
                     } else { Toast.makeText(context, "No images to save", Toast.LENGTH_SHORT).show() }
@@ -1366,10 +1611,10 @@ fun AdjustmentSlider(label: String, value: Float, min: Float, max: Float, onValu
     }
 }
 
-suspend fun saveImage(context: Context, originalBitmap: Bitmap, mixedLut: CubeLut?, adj: Adjustments) {
+suspend fun saveImage(context: Context, originalBitmap: Bitmap, mixedLut: CubeLut?, adj: Adjustments, cinematic: CinematicEffects) {
     withContext(Dispatchers.IO) {
         try {
-            val resultBitmap = if (mixedLut != null) LutUtils.applyLutToBitmapFast(originalBitmap, mixedLut, IntArray(originalBitmap.width * originalBitmap.height), adj) else originalBitmap
+            val resultBitmap = if (mixedLut != null) LutUtils.applyLutToBitmapFast(originalBitmap, mixedLut, IntArray(originalBitmap.width * originalBitmap.height), adj, cinematic) else originalBitmap
             val filename = "ProEdit_\${System.currentTimeMillis()}.png"
             val values = ContentValues().apply {
                 put(MediaStore.Images.Media.DISPLAY_NAME, filename)
